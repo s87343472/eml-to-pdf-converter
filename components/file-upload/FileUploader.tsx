@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useRef, useCallback } from 'react';
-import { useAppStore } from '@/lib/store/app-store';
+import { useConverterStore } from '@/store/converter-store';
 import { useDropzone } from 'react-dropzone';
 
 interface FileUploaderProps {
@@ -27,20 +27,25 @@ export function FileUploader({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
   
-  const { addFiles, addLog } = useAppStore();
+  const { addLog, files: existingFiles } = useConverterStore();
   
   // 验证文件
   const validateFile = (file: File): boolean => {
+    console.log('验证文件:', file.name, file.size, file.type);
+    
     // 检查文件大小
     if (file.size > maxFileSize) {
-      addLog('warning', `文件 ${file.name} 超过大小限制 (${Math.round(maxFileSize / 1024 / 1024)}MB)`);
+      addLog(`文件 ${file.name} 超过大小限制 (${Math.round(maxFileSize / 1024 / 1024)}MB)`);
       return false;
     }
     
     // 检查文件类型
     const fileExtension = `.${file.name.split('.').pop()?.toLowerCase()}`;
+    console.log('文件扩展名:', fileExtension);
+    console.log('接受的文件类型:', acceptedFileTypes);
+    
     if (!acceptedFileTypes.includes(fileExtension)) {
-      addLog('warning', `文件 ${file.name} 类型不支持，仅支持 ${acceptedFileTypes.join(', ')} 文件`);
+      addLog(`文件 ${file.name} 类型不支持，仅支持 ${acceptedFileTypes.join(', ')} 文件`);
       return false;
     }
     
@@ -49,20 +54,44 @@ export function FileUploader({
   
   // 处理文件
   const handleFiles = useCallback((files: FileList | File[]) => {
+    console.log('处理文件:', files);
     const validFiles: File[] = [];
+    const fileSet = new Set<string>(); // 用于去重
+    
+    // 添加现有文件到文件集
+    existingFiles.forEach(file => {
+      const fileKey = `${file.name}-${file.size}-${file.lastModified}`;
+      fileSet.add(fileKey);
+    });
     
     Array.from(files).forEach(file => {
-      if (validateFile(file)) {
-        validFiles.push(file);
+      // 生成文件唯一标识
+      const fileKey = `${file.name}-${file.size}-${file.lastModified}`;
+      console.log('文件标识:', fileKey);
+      
+      // 检查文件是否已存在
+      if (!fileSet.has(fileKey)) {
+        if (validateFile(file)) {
+          validFiles.push(file);
+          fileSet.add(fileKey);
+          console.log('文件验证通过:', file.name);
+        }
+      } else {
+        addLog(`文件 ${file.name} 已存在，已跳过`);
+        console.log('文件已存在，跳过:', file.name);
       }
     });
     
     if (validFiles.length > 0) {
-      addFiles(validFiles);
-      addLog('info', `已添加 ${validFiles.length} 个文件`);
-      onFilesAdded(validFiles);
+      console.log('有效文件数量:', validFiles.length);
+      // 合并现有文件和新文件
+      const newFiles = [...existingFiles, ...validFiles];
+      // 只调用一次 onFilesAdded
+      onFilesAdded(newFiles);
+    } else {
+      console.log('没有有效文件');
     }
-  }, [addFiles, addLog, validateFile, onFilesAdded]);
+  }, [validateFile, onFilesAdded, addLog, existingFiles]);
   
   // 处理拖放
   const handleDragOver = useCallback((e: React.DragEvent<HTMLDivElement>) => {
@@ -83,16 +112,19 @@ export function FileUploader({
     setIsDragging(false);
     
     if (e.dataTransfer.files.length > 0) {
+      console.log('拖放文件:', e.dataTransfer.files);
       handleFiles(e.dataTransfer.files);
     }
   }, [handleFiles]);
   
   // 处理文件选择
   const handleFileSelect = useCallback(() => {
+    console.log('点击选择文件按钮');
     fileInputRef.current?.click();
   }, []);
   
   const handleFileInputChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    console.log('文件输入变化:', e.target.files);
     if (e.target.files && e.target.files.length > 0) {
       handleFiles(e.target.files);
       // 重置input，允许选择相同文件
@@ -102,6 +134,7 @@ export function FileUploader({
   
   // 处理文件夹选择
   const handleFolderSelect = useCallback(() => {
+    console.log('点击选择文件夹按钮');
     // 创建一个隐藏的input元素用于选择文件夹
     const input = document.createElement('input');
     input.type = 'file';
@@ -111,10 +144,12 @@ export function FileUploader({
     input.onchange = (e: Event) => {
       const target = e.target as HTMLInputElement;
       if (target.files) {
+        console.log('文件夹中的文件:', target.files);
         // 过滤出.eml文件
         const emlFiles = Array.from(target.files).filter(file => 
           file.name.toLowerCase().endsWith('.eml')
         );
+        console.log('过滤后的EML文件:', emlFiles);
         handleFiles(emlFiles);
       }
     };
@@ -128,6 +163,7 @@ export function FileUploader({
       'message/rfc822': acceptedFileTypes,
     },
     maxFiles: maxFiles || undefined,
+    noClick: true, // 禁用默认的点击行为
   });
 
   return (
@@ -202,4 +238,4 @@ declare module 'react' {
     directory?: string;
     webkitdirectory?: string;
   }
-} 
+}

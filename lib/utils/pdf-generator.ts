@@ -1,6 +1,11 @@
-import { PDFDocument, StandardFonts, rgb, PDFFont, PDFPage } from 'pdf-lib';
+import { PDFDocument, StandardFonts, rgb, PDFFont, PDFPage, PDFImage } from 'pdf-lib';
 import html2canvas from 'html2canvas';
 import { ParsedEmail, EmailAttachment } from './eml-parser';
+import fontkit from '@pdf-lib/fontkit';
+import { join } from 'path';
+import { readFileSync } from 'fs';
+import { ParsedMail } from 'mailparser';
+import { Worker } from 'worker_threads';
 
 /**
  * 将HTML内容转换为PDF
@@ -690,4 +695,398 @@ export async function mergePdfs(pdfBuffers: Uint8Array[]): Promise<Uint8Array> {
   
   // 保存合并后的PDF
   return await mergedPdf.save();
+}
+
+interface PdfGeneratorOptions {
+  fontSize?: number;
+  margin?: number;
+  lineHeight?: number;
+  maxLineLength?: number;
+}
+
+export class PdfGenerator {
+  private pdfDoc!: PDFDocument;
+  private regularFont!: PDFFont;
+  private boldFont!: PDFFont;
+  private options: Required<PdfGeneratorOptions>;
+  private fontWidthCache = new Map<string, number>();
+  private static fontCache: { regular?: Uint8Array; bold?: Uint8Array } = {};
+
+  constructor(options: PdfGeneratorOptions = {}) {
+    this.options = {
+      fontSize: options.fontSize || 11,
+      margin: options.margin || 50,
+      lineHeight: options.lineHeight || 1.5,
+      maxLineLength: options.maxLineLength || 100,
+    };
+  }
+
+  private async loadFonts(): Promise<void> {
+    console.log('PDF: 加载字体');
+    try {
+      // 使用静态缓存避免重复读取字体文件
+      if (!PdfGenerator.fontCache.regular || !PdfGenerator.fontCache.bold) {
+        const fontPath = join(process.cwd(), 'node_modules', '@fontsource', 'noto-sans-sc', 'files', 'noto-sans-sc-chinese-simplified-400-normal.woff');
+        const fontBoldPath = join(process.cwd(), 'node_modules', '@fontsource', 'noto-sans-sc', 'files', 'noto-sans-sc-chinese-simplified-700-normal.woff');
+        
+        [PdfGenerator.fontCache.regular, PdfGenerator.fontCache.bold] = await Promise.all([
+          readFileSync(fontPath),
+          readFileSync(fontBoldPath)
+        ]);
+      }
+
+      [this.regularFont, this.boldFont] = await Promise.all([
+        this.pdfDoc.embedFont(PdfGenerator.fontCache.regular!),
+        this.pdfDoc.embedFont(PdfGenerator.fontCache.bold!)
+      ]);
+      
+      console.log('PDF: 字体加载完成');
+    } catch (error) {
+      console.error('PDF: 加载字体失败:', error);
+      throw error;
+    }
+  }
+
+  private getTextWidth(text: string, fontSize: number): number {
+    const cacheKey = `${text}_${fontSize}`;
+    if (this.fontWidthCache.has(cacheKey)) {
+      return this.fontWidthCache.get(cacheKey)!;
+    }
+    const width = this.regularFont.widthOfTextAtSize(text, fontSize);
+    this.fontWidthCache.set(cacheKey, width);
+    return width;
+  }
+
+  private wrapText(text: string, maxWidth: number): string[] {
+    if (!text) return [];
+    
+    const lines: string[] = [];
+    const paragraphs = text.split('\n');
+    const spaceWidth = this.getTextWidth(' ', this.options.fontSize);
+
+    for (const paragraph of paragraphs) {
+      if (!paragraph.trim()) {
+        lines.push('');
+        continue;
+      }
+
+      // 优化：预先计算每个字符的宽度
+      const chars = Array.from(paragraph);
+      const charWidths = new Float64Array(chars.length);
+      for (let i = 0; i < chars.length; i++) {
+        charWidths[i] = this.getTextWidth(chars[i], this.options.fontSize);
+      }
+
+      let currentLine = '';
+      let currentWidth = 0;
+      let start = 0;
+
+      for (let i = 0; i < chars.length; i++) {
+        const char = chars[i];
+        const charWidth = charWidths[i];
+        
+        if (currentWidth + charWidth > maxWidth) {
+          if (currentLine) {
+            lines.push(currentLine);
+            currentLine = '';
+            currentWidth = 0;
+            i = start - 1; // 回退一个字符重新开始
+          } else {
+            // 单个字符就超过最大宽度，强制换行
+            lines.push(char);
+            start = i + 1;
+          }
+        } else {
+          currentLine += char;
+          currentWidth += charWidth;
+          if (char === ' ') start = i + 1;
+        }
+      }
+
+      if (currentLine) {
+        lines.push(currentLine);
+      }
+    }
+
+    return lines;
+  }
+
+  async generateFromParsedMail(parsedMail: ParsedMail): Promise<Uint8Array> {
+    console.log('PDF: 开始生成 PDF');
+    const startTime = Date.now();
+    const pageSize = { width: 595, height: 842 }; // A4尺寸
+
+    try {
+      // 初始化文档
+      this.pdfDoc = await PDFDocument.create();
+      this.pdfDoc.registerFontkit(fontkit);
+      await this.loadFonts();
+
+      // 并行处理文本和图片
+      const [textPages, images] = await Promise.all([
+        this.processText(parsedMail, pageSize),
+        this.processImages(parsedMail)
+      ]);
+
+      // 合并所有页面
+      const allPages = [
+        ...await this.createHeaderPage(parsedMail, pageSize),
+        ...textPages
+      ];
+
+      // 添加图片页面
+      if (images.length > 0) {
+        allPages.push(...await this.createImagePages(images, pageSize));
+      }
+
+      // 添加附件信息页
+      if (parsedMail.attachments.length > 0) {
+        allPages.push(...await this.createAttachmentPages(parsedMail.attachments, pageSize));
+      }
+
+      // 保存PDF
+      console.log('PDF: 开始保存，总页数:', allPages.length);
+      const pdfBytes = await this.pdfDoc.save({
+        useObjectStreams: false,
+        addDefaultPage: false
+      });
+
+      const endTime = Date.now();
+      console.log('PDF: 文档生成完成', {
+        size: `${(pdfBytes.length / 1024).toFixed(2)}KB`,
+        pages: allPages.length,
+        time: `${endTime - startTime}ms`
+      });
+
+      return pdfBytes;
+    } catch (error) {
+      console.error('PDF: 生成过程中出错:', error);
+      throw error;
+    }
+  }
+
+  private async processText(parsedMail: ParsedMail, pageSize: { width: number; height: number }): Promise<PDFPage[]> {
+    const pages: PDFPage[] = [];
+    const textContent = parsedMail.text || '';
+    
+    // 预处理文本
+    const paragraphs = textContent.split('\n\n')
+      .filter(p => p.trim())
+      .map(p => p.replace(/\r\n/g, '\n'));
+
+    let currentPage = this.pdfDoc.addPage([pageSize.width, pageSize.height]);
+    pages.push(currentPage);
+    let yPos = pageSize.height - this.options.margin;
+
+    // 添加标题
+    currentPage.drawText('邮件内容 / Email Content', {
+      x: this.options.margin,
+      y: yPos,
+      size: 16,
+      font: this.boldFont,
+      color: rgb(0, 0, 0),
+    });
+    yPos -= this.options.fontSize * 2;
+
+    // 使用批处理来处理段落
+    const BATCH_SIZE = 10;
+    for (let i = 0; i < paragraphs.length; i += BATCH_SIZE) {
+      const batch = paragraphs.slice(i, Math.min(i + BATCH_SIZE, paragraphs.length));
+      
+      for (const paragraph of batch) {
+        const lines = this.wrapText(paragraph, pageSize.width - this.options.margin * 2);
+        
+        for (const line of lines) {
+          if (yPos < this.options.margin + this.options.fontSize) {
+            currentPage = this.pdfDoc.addPage([pageSize.width, pageSize.height]);
+            pages.push(currentPage);
+            yPos = pageSize.height - this.options.margin;
+          }
+
+          if (line.trim()) {
+            currentPage.drawText(line.trim(), {
+              x: this.options.margin,
+              y: yPos,
+              size: this.options.fontSize,
+              font: this.regularFont,
+              color: rgb(0, 0, 0),
+            });
+          }
+          yPos -= this.options.fontSize * this.options.lineHeight;
+        }
+        yPos -= this.options.fontSize * this.options.lineHeight;
+      }
+    }
+
+    return pages;
+  }
+
+  private async processImages(parsedMail: ParsedMail): Promise<PDFImage[]> {
+    if (!parsedMail.attachments?.length) return [];
+
+    const imageAttachments = parsedMail.attachments.filter(
+      att => att.contentType?.startsWith('image/') && att.content
+    );
+
+    if (!imageAttachments.length) return [];
+
+    console.log(`PDF: 处理 ${imageAttachments.length} 个图片`);
+    
+    const imagePromises = imageAttachments.map(async (attachment) => {
+      try {
+        if (!attachment.content) return null;
+        return attachment.contentType?.includes('jpeg') || attachment.contentType?.includes('jpg')
+          ? await this.pdfDoc.embedJpg(attachment.content)
+          : await this.pdfDoc.embedPng(attachment.content);
+      } catch (error) {
+        console.warn('PDF: 处理图片失败:', error);
+        return null;
+      }
+    });
+
+    const images = (await Promise.all(imagePromises)).filter(Boolean) as PDFImage[];
+    console.log(`PDF: 成功处理 ${images.length} 个图片`);
+    return images;
+  }
+
+  private async createImagePages(images: PDFImage[], pageSize: { width: number; height: number }): Promise<PDFPage[]> {
+    const pages: PDFPage[] = [];
+    
+    for (const image of images) {
+      const page = this.pdfDoc.addPage([pageSize.width, pageSize.height]);
+      pages.push(page);
+
+      const maxWidth = pageSize.width - this.options.margin * 2;
+      const maxHeight = pageSize.height - this.options.margin * 2;
+      
+      const scale = Math.min(
+        maxWidth / image.width,
+        maxHeight / image.height,
+        1
+      );
+
+      const width = image.width * scale;
+      const height = image.height * scale;
+
+      const x = (pageSize.width - width) / 2;
+      const y = (pageSize.height - height) / 2;
+
+      page.drawImage(image, {
+        x,
+        y,
+        width,
+        height
+      });
+    }
+
+    return pages;
+  }
+
+  private async createHeaderPage(parsedMail: ParsedMail, pageSize: { width: number; height: number }): Promise<PDFPage[]> {
+    const page = this.pdfDoc.addPage([pageSize.width, pageSize.height]);
+    const drawer = this.createTextDrawer(page);
+    
+    // 添加标题和基本信息
+    drawer.drawBoldText('邮件信息 / Email Information');
+    drawer.moveDown(2);
+
+    const fields = [
+      ['主题 / Subject:', parsedMail.subject || ''],
+      ['发件人 / From:', parsedMail.from?.text || ''],
+      ['收件人 / To:', Array.isArray(parsedMail.to) ? parsedMail.to.map(addr => addr.text).join(', ') : ''],
+      ['日期 / Date:', parsedMail.date ? parsedMail.date.toLocaleString() : '']
+    ];
+
+    for (const [label, value] of fields) {
+      drawer.drawBoldText(label);
+      drawer.drawRegularText(value, this.options.margin + 100);
+      drawer.moveDown(2);
+    }
+
+    return [page];
+  }
+
+  private async createAttachmentPages(attachments: ParsedMail['attachments'], pageSize: { width: number; height: number }): Promise<PDFPage[]> {
+    const pages: PDFPage[] = [];
+    const page = this.pdfDoc.addPage([pageSize.width, pageSize.height]);
+    pages.push(page);
+    
+    const drawer = this.createTextDrawer(page);
+    drawer.drawBoldText('附件列表 / Attachments List:');
+    drawer.moveDown(2);
+
+    for (const attachment of attachments) {
+      if (drawer.needsNewPage()) {
+        const newPage = this.pdfDoc.addPage([pageSize.width, pageSize.height]);
+        pages.push(newPage);
+        drawer.resetPage(newPage);
+      }
+
+      drawer.drawBoldText(`文件名: ${attachment.filename || '未知'}`);
+      drawer.moveDown();
+      drawer.drawRegularText(`类型: ${attachment.contentType}`, this.options.margin + 20);
+      drawer.moveDown();
+      drawer.drawRegularText(`大小: ${this.formatFileSize(attachment.size || 0)}`, this.options.margin + 20);
+      drawer.moveDown(2);
+    }
+
+    return pages;
+  }
+
+  private createTextDrawer(page: PDFPage) {
+    const { fontSize, margin, lineHeight } = this.options;
+    let yPos = page.getSize().height - margin;
+    const actualLineHeight = fontSize * lineHeight;
+
+    return {
+      drawBoldText: (text: string, x: number = margin) => {
+        try {
+          page.drawText(text, {
+            x,
+            y: yPos,
+            size: fontSize,
+            font: this.boldFont,
+            color: rgb(0, 0, 0),
+          });
+        } catch (error) {
+          console.error('PDF: 绘制粗体文本失败:', { text, error });
+        }
+      },
+
+      drawRegularText: (text: string, x: number = margin) => {
+        try {
+          page.drawText(text, {
+            x,
+            y: yPos,
+            size: fontSize,
+            font: this.regularFont,
+            color: rgb(0, 0, 0),
+          });
+        } catch (error) {
+          console.error('PDF: 绘制常规文本失败:', { text, error });
+        }
+      },
+
+      moveDown: (lines: number = 1) => {
+        yPos -= actualLineHeight * lines;
+      },
+
+      getCurrentY: () => yPos,
+
+      needsNewPage: () => yPos < margin,
+
+      resetPage: (newPage: PDFPage) => {
+        page = newPage;
+        yPos = page.getSize().height - margin;
+      }
+    };
+  }
+
+  private formatFileSize(bytes: number): string {
+    if (bytes === 0) return '0 Bytes';
+    const k = 1024;
+    const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+  }
 } 

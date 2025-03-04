@@ -1,4 +1,4 @@
-import { parse } from 'emailjs-mime-parser';
+import { simpleParser } from 'mailparser';
 import jschardet from 'jschardet';
 
 export interface ParsedEmail {
@@ -22,149 +22,105 @@ export interface EmailAttachment {
   size: number;
 }
 
+// 创建一个延迟加载的 Worker
+let worker: Worker | null = null;
+
+function getWorker() {
+  if (!worker && typeof window !== 'undefined') {
+    worker = new Worker(new URL('../workers/eml-parser.worker.ts', import.meta.url));
+  }
+  return worker;
+}
+
 /**
  * 解析EML文件内容
  * @param emlContent EML文件内容（字符串或ArrayBuffer）
  * @returns 解析后的邮件对象
  */
 export async function parseEmlContent(emlContent: string | ArrayBuffer): Promise<ParsedEmail> {
-  // 如果输入是ArrayBuffer，转换为字符串
-  let content: string;
+  // 如果在服务器端，直接解析
+  if (typeof window === 'undefined') {
+    return parseEmlContentSync(emlContent);
+  }
+
+  // 在客户端使用 Worker
+  return new Promise((resolve, reject) => {
+    const worker = getWorker();
+    if (!worker) {
+      reject(new Error('无法创建 Web Worker'));
+      return;
+    }
+
+    // 处理 Worker 消息
+    const messageHandler = (e: MessageEvent) => {
+      const { success, data, error } = e.data;
+      
+      // 移除消息处理器
+      worker.removeEventListener('message', messageHandler);
+      
+      if (success) {
+        resolve(processParsedData(data));
+      } else {
+        reject(new Error(error));
+      }
+    };
+    
+    // 添加消息处理器
+    worker.addEventListener('message', messageHandler);
+    
+    // 发送数据给 Worker
+    worker.postMessage({
+      content: emlContent,
+      type: emlContent instanceof ArrayBuffer ? 'arraybuffer' : 'string'
+    });
+  });
+}
+
+/**
+ * 同步解析EML内容（用于服务器端）
+ */
+async function parseEmlContentSync(emlContent: string | ArrayBuffer): Promise<ParsedEmail> {
+  let content: string = '';
+  
   if (emlContent instanceof ArrayBuffer) {
     const buffer = new Uint8Array(emlContent);
-    // 检测编码
-    const detected = jschardet.detect(buffer);
-    const encoding = detected.encoding || 'utf-8';
-    
-    try {
-      const decoder = new TextDecoder(encoding);
-      content = decoder.decode(buffer);
-    } catch (e) {
-      // 如果检测到的编码不支持，回退到UTF-8
-      const decoder = new TextDecoder('utf-8');
-      content = decoder.decode(buffer);
-    }
+    content = new TextDecoder().decode(buffer);
   } else {
     content = emlContent;
   }
 
-  // 解析EML内容
-  const parsed = parse(content);
-  
-  // 提取基本信息
-  const subject = decodeHeaderValue(getHeaderValue(parsed.headers, 'subject') || '无主题');
-  const from = decodeHeaderValue(getHeaderValue(parsed.headers, 'from') || '');
-  const to = getAddressListFromHeader(parsed.headers, 'to');
-  const cc = getAddressListFromHeader(parsed.headers, 'cc');
-  
-  // 解析日期
-  let date: Date | null = null;
-  const dateStr = getHeaderValue(parsed.headers, 'date');
-  if (dateStr) {
-    try {
-      date = new Date(dateStr);
-    } catch (e) {
-      console.error('无法解析邮件日期:', dateStr);
-    }
+  try {
+    // 解析EML内容
+    const parsed = await simpleParser(content);
+    return processParsedData(parsed);
+  } catch (error) {
+    console.error('解析EML失败:', error);
+    throw error;
   }
-  
-  // 提取正文和附件
-  let textBody = '';
-  let htmlBody: string | null = null;
-  const attachments: EmailAttachment[] = [];
-  
-  // 收集所有头信息
-  const headers: Record<string, string> = {};
-  if (parsed.headers) {
-    for (const [key, value] of parsed.headers.entries()) {
-      if (typeof value === 'string') {
-        headers[key.toLowerCase()] = decodeHeaderValue(value);
-      } else if (value && value.value) {
-        headers[key.toLowerCase()] = decodeHeaderValue(value.value);
-      }
-    }
-  }
-  
-  // 处理邮件内容部分
-  processNode(parsed, {
-    textBody: (text) => { textBody += text; },
-    htmlBody: (html) => { htmlBody = htmlBody ? htmlBody + html : html; },
-    attachment: (attachment) => { attachments.push(attachment); }
-  });
-  
-  return {
-    subject,
-    from,
-    to,
-    cc,
-    date,
-    textBody,
-    htmlBody,
-    attachments,
-    headers
-  };
 }
 
 /**
- * 递归处理MIME节点
+ * 处理解析后的数据
  */
-function processNode(
-  node: any, 
-  handlers: {
-    textBody: (text: string) => void;
-    htmlBody: (html: string) => void;
-    attachment: (attachment: EmailAttachment) => void;
-  }
-) {
-  // 检查是否是多部分内容
-  if (node.childNodes && node.childNodes.length > 0) {
-    // 递归处理子节点
-    for (const childNode of node.childNodes) {
-      processNode(childNode, handlers);
-    }
-    return;
-  }
-  
-  // 获取内容类型和传输编码
-  const contentType = (node.contentType || {}).value || '';
-  const contentDisposition = getHeaderValue(node.headers, 'content-disposition') || '';
-  const filename = getFilenameFromHeaders(node.headers);
-  const contentId = getHeaderValue(node.headers, 'content-id')?.replace(/[<>]/g, '') || undefined;
-  const contentTransferEncoding = getHeaderValue(node.headers, 'content-transfer-encoding') || '';
-  
-  // 检查是否是附件
-  const isAttachment = contentDisposition.includes('attachment') || 
-                       (filename && filename.length > 0);
-  
-  if (isAttachment) {
-    // 处理附件
-    handlers.attachment({
-      filename: decodeHeaderValue(filename || `attachment-${Date.now()}`),
-      contentType,
-      content: node.content,
-      contentId,
-      disposition: contentDisposition,
-      size: node.content ? node.content.byteLength : 0
-    });
-  } else if (contentType.includes('text/plain')) {
-    // 处理纯文本内容
-    const text = decodeContent(node.content, contentTransferEncoding);
-    handlers.textBody(text);
-  } else if (contentType.includes('text/html')) {
-    // 处理HTML内容
-    const html = decodeContent(node.content, contentTransferEncoding);
-    handlers.htmlBody(html);
-  } else if (contentType.includes('image/') && contentId) {
-    // 处理内嵌图片
-    handlers.attachment({
-      filename: decodeHeaderValue(filename || `image-${contentId}`),
-      contentType,
-      content: node.content,
-      contentId,
-      disposition: 'inline',
-      size: node.content ? node.content.byteLength : 0
-    });
-  }
+function processParsedData(parsed: any): ParsedEmail {
+  return {
+    subject: parsed.subject || '',
+    from: parsed.from?.text || '',
+    to: Array.isArray(parsed.to) ? parsed.to.map((addr: any) => addr.text) : [],
+    cc: Array.isArray(parsed.cc) ? parsed.cc.map((addr: any) => addr.text) : [],
+    date: parsed.date || null,
+    textBody: parsed.text || '',
+    htmlBody: parsed.html || null,
+    attachments: parsed.attachments.map((att: any) => ({
+      filename: att.filename || '',
+      contentType: att.contentType || '',
+      content: att.content,
+      contentId: att.contentId,
+      disposition: att.contentDisposition,
+      size: att.size || 0
+    })),
+    headers: Object.fromEntries(parsed.headers)
+  };
 }
 
 /**
@@ -179,20 +135,6 @@ function getHeaderValue(headers: any, name: string): string | undefined {
   if (typeof header === 'string') return header;
   if (header.value) return header.value;
   return undefined;
-}
-
-/**
- * 从头部获取地址列表
- */
-function getAddressListFromHeader(headers: any, name: string): string[] {
-  const header = getHeaderValue(headers, name);
-  if (!header) return [];
-  
-  // 解码头部值
-  const decodedHeader = decodeHeaderValue(header);
-  
-  // 简单的邮箱地址提取，实际应用中可能需要更复杂的解析
-  return decodedHeader.split(',').map(addr => addr.trim());
 }
 
 /**
@@ -283,26 +225,3 @@ function decodeQuotedPrintable(text: string): string {
       return String.fromCharCode(parseInt(hex, 16));
     });
 }
-
-/**
- * 解码邮件头部值（支持RFC 2047编码）
- */
-function decodeHeaderValue(value: string): string {
-  if (!value) return '';
-  
-  // 处理RFC 2047编码的头部
-  return value.replace(/=\?([^?]+)\?([BQ])\?([^?]+)\?=/g, (_, charset, encoding, text) => {
-    try {
-      if (encoding.toUpperCase() === 'B') {
-        // Base64编码
-        return decodeURIComponent(escape(atob(text)));
-      } else if (encoding.toUpperCase() === 'Q') {
-        // Quoted-Printable编码
-        return decodeURIComponent(escape(decodeQuotedPrintable(text)));
-      }
-    } catch (e) {
-      console.error('解码头部失败:', value, e);
-    }
-    return text;
-  });
-} 

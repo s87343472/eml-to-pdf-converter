@@ -191,6 +191,7 @@ async function readFileAsArrayBuffer(file: File): Promise<ArrayBuffer> {
       reject(new Error('读取文件时发生错误'));
     };
     
+    // 直接读取为 ArrayBuffer
     reader.readAsArrayBuffer(file);
   });
 }
