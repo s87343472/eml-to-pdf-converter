@@ -1,0 +1,90 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+node_modules
+.pnp
+.pnp.js
+.pnpm-store/
+
+# testing
+coverage
+
+# next.js
+.next/
+out/
+
+# production
+build
+dist
+
+# misc
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-debug.log*
+
+# env files (can opt-in for committing if needed)
+.env*
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+# PWA 文件
+**/public/sw.js
+**/public/workbox-*.js
+**/public/worker-*.js
+**/public/fallback-*.js
+**/public/sw.js.map
+**/public/workbox-*.js.map
+**/public/worker-*.js.map
+
+# 临时文件
+.temp
+.tmp
+.cache
+
+# 用户上传的文件（如果有）
+uploads/
+*.eml
+*.pdf
+
+# 测试文件
+/cypress/videos/
+/cypress/screenshots/
+
+# Storybook
+storybook-static
+
+# 其他
+.turbo
+
+# 本地环境文件
+.DS_Store
+*.pem
+Thumbs.db
+
+# 编辑器目录和文件
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+*.swp
+*.swo
+
+# 包管理器锁定文件
+# 根据您的偏好，可能需要注释掉以下行
+# package-lock.json
+# yarn.lock
+# pnpm-lock.yaml
